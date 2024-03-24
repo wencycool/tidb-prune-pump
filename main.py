@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # coding=utf-8
+import concurrent.futures
 import logging
 import os
 import pathlib
 import shutil
 import socket
+import threading
 import time
 import urllib.request
 import json
@@ -27,10 +29,16 @@ import atexit
 # 7. 恢复pump.toml配置文件
 # 8. 检查pump是否正常运行，状态（http://127.0.0.1:8250/status）是否正常
 # 9. 检查pump是否继续接受binlog日志写入（http://127.0.0.1:8250/binlog/recover?op=status)，如果不正常则重置写入状态
-
-
 # 说明：
 # 整个过程会涉及两次pump的重启，需要控制一个集群中不能同时重启所有的pump，否则会导致写binlog暂停
+
+# 当多个pump同时执行gc时，需要保证串行执行，起码不能同时暂停pump，否则会导致写binlog暂停
+# 分布式串行执行逻辑：
+# 1. 利用127.0.0.1:10080/status查询所有pump的IP和端口
+# 2. 依次连接所有pump节点的IP:53556，查看目标脚本是否正在执行，如果重复轮询判断，直到超时退出
+# 3. 如果有任何pump节点在执行，则本启动对53556端口的监听，并等待3秒钟后再次判断是否有其他节点在执行（避免同时执行），如果有则等待，则只保留IP最大的节点执行
+# 4. 执行完毕后，释放监听端口
+
 
 deploy_dir = "/tidb-deploy/pump-8250"
 pump_config_file = pathlib.Path(deploy_dir) / "conf" / "pump.toml"
@@ -46,6 +54,7 @@ def scientific_to_int(scientific_str):
     from decimal import Decimal, ROUND_DOWN
     num = Decimal(scientific_str)
     return int(num.to_integral_value(rounding=ROUND_DOWN))
+
 
 def get_pump_ps_info():
     """
@@ -191,7 +200,8 @@ def generate_pump_safe_gcTS(drainer_maxCommitTS, offset=10 * 60):
     # 往前推迟1 分钟作为校验值，另外，在pump做gc时内部也会自动做gc - 10分钟（maxTxnTimeoutSecond），因此实际打印的do_gcTS是比传入的值小10分钟
     gcTS_unix_timestamp_check = time.time() - time_diff_with_offset - max_txn_timeout_second - 60
     gcTS_unix_timestamp_check_format = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gcTS_unix_timestamp_check))
-    logging.debug(f"generate pump gcTS: {generate_golang_duration(time_diff_with_offset)}, gcTS_unix_timestamp_check: {gcTS_unix_timestamp_check_format}")
+    logging.debug(
+        f"generate pump gcTS: {generate_golang_duration(time_diff_with_offset)}, gcTS_unix_timestamp_check: {gcTS_unix_timestamp_check_format}")
     return generate_golang_duration(time_diff_with_offset), gcTS_unix_timestamp_check
 
 
@@ -320,8 +330,10 @@ def do_pump_gc_trigger(gcTS_unix_timestamp_check: int):
         else:
             # do_gcTS_unix_timestamp转为标准时间格式
             do_gcTS_unix_timestamp_format = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(do_gcTS_unix_timestamp))
-            gcTS_unix_timestamp_check_format = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gcTS_unix_timestamp_check))
-            logging.debug(f"do pump gcTS: {do_gcTS_unix_timestamp_format} less than gcTS_unix_timestamp_check: {gcTS_unix_timestamp_check_format}, repeat check...")
+            gcTS_unix_timestamp_check_format = time.strftime("%Y-%m-%d %H:%M:%S",
+                                                             time.localtime(gcTS_unix_timestamp_check))
+            logging.debug(
+                f"do pump gcTS: {do_gcTS_unix_timestamp_format} less than gcTS_unix_timestamp_check: {gcTS_unix_timestamp_check_format}, repeat check...")
         time.sleep(1)
         do_gcTS = get_pump_do_gcTS()
         if do_gcTS is None:
@@ -371,6 +383,153 @@ def tidb_write_pump_skipped(ip="127.0.0.1", port=10080, do=True):
         except Exception as e:
             logging.error(f"reset pump write status failed: {e}")
             return True
+
+
+# 分布式串行执行逻辑代码
+# 获取当前所有pump的IP和端口
+# http://192.168.31.101:8250/status
+# {"status":{"192.168.31.101:8250":{"nodeId":"192.168.31.101:8250","host":"192.168.31.101:8250","state":"online","isAlive":false,"score":0,"label":null,"maxCommitTS":448599350057893889,"updateTS":448599350254764042},"192.168.31.102:8250":{"nodeId":"192.168.31.102:8250","host":"192.168.31.102:8250","state":"online","isAlive":false,"score":0,"label":null,"maxCommitTS":448599350477586435,"updateTS":448599350372204545}},"CommitTS":448599350922969089,"Checkpoint":{},"ErrMsg":""}
+def get_pumps():
+    """
+    获取所有pump的IP和端口
+    :return: 返回所有pump的host(ip:port)列表
+    """
+    http_url = "http://127.0.0.1:8250/status"
+    pumps = []
+    try:
+        with urllib.request.urlopen(http_url) as f:
+            data = f.read().decode('utf-8')
+            data = json.loads(data)
+            for v in data["status"].values():
+                pumps.append(v["host"])
+    except Exception as e:
+        logging.error(f"get pumps failed: {e}")
+        return None
+    # pump组成为："ip:port"
+    return pumps
+
+
+# 通过tcp探测远程端口服务是否正常（类似于telnet是否通）
+def telnet_remote_port(host, port, timeout=2):
+    """
+    检查远程端口是否正常
+    :param host: 主机ip
+    :param port: 端口
+    :param timeout: 超时时间
+    :return: True表示正常，False表示异常
+    """
+    import telnetlib
+    try:
+        tn = telnetlib.Telnet(host, port, timeout)
+        tn.close()
+        return True
+    except Exception as e:
+        return False
+
+
+# 在一批主机和端口中并发探测
+def muti_telnet_remote_port(iports, timeout=2):
+    """
+    并发telnet远程端口号，并返回端口号是否可访问
+    :param iports: [(ip,port),...]
+    :param timeout:
+    :return: [(ip,port,status),...] status为True代表可连通，False代表不通
+    """
+    results = []
+
+    def _telnet_remote_port(host, port):
+        return host, port, telnet_remote_port(host, port, timeout)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=5) as exector:
+        tasks = [exector.submit(_telnet_remote_port, ip, port) for ip, port in iports]
+        for task in as_completed(tasks):
+            results.append(task.result())
+    return results
+
+
+#查询本地IP
+def get_local_ips(loopback=False):
+    """
+    查询本地所有IP列表
+    :param loopback: 是否包含回环地址
+    :return:
+    """
+    ips = []
+    for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+        if loopback or not ip.startswith("127"):
+            ips.append(ip)
+    return ips
+
+
+class Lock:
+    """
+    利用端口号探测模拟分布式锁
+    """
+
+    def __init__(self):
+        self.port = 53556
+        self.locked = False
+        self.service = None
+
+    def _is_locked(self, include=False):
+        """
+        查询锁是否存在
+        :param include:是否包含本地已上锁
+        :return: 如果已经存在锁则返回True，否则返回False
+        """
+        pumps = get_pumps()
+        if not pumps:
+            raise Exception("cannot find pumps")
+        iports = [(iport.split(":")[0], self.port) for iport in pumps]
+        result = muti_telnet_remote_port(iports)
+        for each_result in result:
+            host, port, telnet_ok = each_result
+            if not include and host in get_local_ips():
+                continue
+            if telnet_ok:
+                logging.debug(f"host:{host},port:{port} telnet ok!")
+                return True
+        return False
+
+    def acquire(self, timeout=120):
+        """
+        :param timeout:
+        :return: 上锁成功返回True，否则返回False
+        """
+        start_time = time.time()
+        logging.debug(f"start acquire lock")
+        while True:
+            if time.time() - start_time > timeout:
+                logging.error("lock timeout")
+                return False
+            if not self._is_locked():
+                # 开启本地服务，并再次探测其它节点是否存在连通情况
+                try:
+                    self.service = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.service.bind(("0.0.0.0", self.port))
+                    self.service.listen()
+                except Exception as e:
+                    logging.error(f"bind 0.0.0.0:{self.port} failed,port exists!")
+                    return False
+                time.sleep(1)
+                if self._is_locked():
+                    self.service.close()
+                    continue
+                else:
+                    self.locked = True
+                    atexit.register(lambda: self.release())
+                    return True
+            time.sleep(1)
+
+    def release(self):
+        if self.service:
+            try:
+                self.service.close()
+            except Exception as e:
+                pass
+
+# todo 添加文件系统使用率判断规则
 
 
 # 执行清理pump逻辑
@@ -425,13 +584,171 @@ def do_pump_gc():
     return True
 
 
+# 文件锁，方式程序重复执行
+class ProcessLock:
+    """
+    制定锁注册机制，避免一个脚本重复多次执行，给定一个锁文件，如果锁文件存在则判定为脚本已经在执行，否则判定为脚本未执行
+    机制为：
+    在程序获取锁之前：
+    1、如果锁文件不存在，则创建锁文件，获锁成功
+    2、如果锁文件存在，且锁文件中的pid在当前进程列表中不存在，则判定为残留锁文件，清理之，获锁成功
+    3、如果锁文件存在，且锁文件中的pid在当前进程列表中存在，但是mtime超过20小时未更新，则判定为残留锁文件，清理之，获锁成功
+    4、其余情况判定为锁文件被当前进程占用，获取锁失败
+    在程序获取锁之后：
+    1、定期更新锁文件的mtime为当前时间
+    2、如果文件不存在或文件中pid不是当前进程id，则抢锁（__acquire_attempts），并维护锁文件
+    3、抢锁次数不超过max_acquire_attempts次,超过后抛出异常
+    使用方式：
+    with ProcessLock(os.path.join("/tmp", proj_name + ".lock")) as lock:
+        if lock.locked:
+            do something
+        else:
+            logging.info("The script is running,exit!")
+    """
+
+    def __init__(self, lock_file):
+        self.lock_file = lock_file
+        self.locked = False
+        # 避免极端情况下篡改锁文件内容导致多进程相互抢锁，这里限制抢锁次数不得超过10次
+        self.max_acquire_attempts = 10
+        # keepalive的探测周期,默认60秒
+        self.keep_alive_interval = 60
+        self.__acquire_attempts = 0
+        self.__keep_alived = False
+        self.atexit()
+
+    # 当进程退出时，清理锁文件
+    def atexit(self):
+        atexit.register(self.release)
+
+    def acquire(self):
+        if self.__acquire():
+            self.locked = True
+            self.keep_alive()
+            return True
+        return False
+
+    # 尝试获取锁，如果获取成功则返回True，否则返回False
+    def __acquire(self):
+        if self.locked:
+            return True
+        elif os.path.isfile(self.lock_file):
+            # 1、如果锁文件存在，且内容是当前进程的pid，则判断为锁文件被当前进程占用，返回True
+            if str(os.getpid()) == open(self.lock_file).read():
+                # 虽然pid在操作系统当前进程中存在但是不一定是“当前脚本的”，因此结合mtime进一步判断是否脚本的mtime有定期更新，没有定期更新说进程确实不存在
+                # 为避免误操作，这里谨慎处理，如果文件未变化超过20小时则说明确实不存在,清理文件锁
+                if time.time() - os.path.getmtime(self.lock_file) > 20 * 3600:
+                    os.remove(self.lock_file)
+                    return self.acquire()
+                return True
+            # 2、如果文件锁存在，且文件中pid在当前进程列表中不存在，则判定为残留锁文件，清理之
+            try:
+                infile_pid = int(open(self.lock_file).read())
+                if not self.process_id_exists(infile_pid):
+                    os.remove(self.lock_file)
+                    return self.acquire()
+                else:
+                    return False
+            except ValueError:
+                # 说明锁文件中的pid不是数字，清理之
+                os.remove(self.lock_file)
+                return self.acquire()
+        else:
+            # 如果锁文件不存在，则创建锁文件
+            with open(self.lock_file, "w") as f:
+                # 写入当前进程号的pid
+                f.write(str(os.getpid()))
+            return True
+
+    def release(self):
+        if self.locked:
+            os.remove(self.lock_file)
+            self.locked = False
+
+    # 启动一个线程在后台不停的修改self.lock_file的mtime，防止别人篡改锁文件
+    def keep_alive(self):
+        if not self.__keep_alived:
+            t = threading.Thread(target=self.__keep_alive)
+            t.setDaemon(True)
+            t.start()
+            self.__keep_alived = True
+
+    def __keep_alive(self):
+        """
+        每分钟检测一次锁文件是否存在，不存在创建之，存在pid不一致则更新之
+        """
+        while self.locked:
+            if self.max_acquire_attempts < self.__acquire_attempts:
+                self.release()
+                raise Exception("获取锁失败，尝试次数超过%d次" % self.max_acquire_attempts)
+            if os.path.isfile(self.lock_file):
+                # 如果当前进程号不在锁文件中，更新锁文件
+                if str(os.getpid()) != open(self.lock_file).read():
+                    with open(self.lock_file, "w") as f:
+                        # 写入当前进程号的pid
+                        f.write(str(os.getpid()))
+                    self.__acquire_attempts += 1
+                # 定期更新锁文件的mtime为当前时间
+                else:
+                    os.utime(self.lock_file, None)
+            else:
+                with open(self.lock_file, "w") as f:
+                    # 写入当前进程号的pid
+                    f.write(str(os.getpid()))
+                self.__acquire_attempts += 1
+            time.sleep(self.keep_alive_interval)
+
+    # 检查进程号是否存在，如果不存在则返回False，否则返回True
+    def process_id_exists(self, pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        else:
+            return True
+
+    # 支持with语法
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
 def main():
-    if do_pump_gc():
-        logging.info("do gc success!")
-    else:
-        logging.info("do gc failed")
+    lock = Lock()
+    try:
+        if lock.acquire(timeout=300):
+            logging.info("acquire lock ok")
+            if do_pump_gc():
+                logging.info("do gc success!")
+            else:
+                logging.info("do gc failed")
+            lock.release()
+        else:
+            logging.info("acquire lock failed")
+    except Exception as e:
+        logging.error(f"main error: {e}")
+        lock.release()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    main()
+    # 输出到日志文件中，日志文件名为当前脚本的名字加.log后缀
+    proj_name = os.path.basename(__file__).split(".")[0]
+    # 绝对路径
+    file_path = os.path.dirname(os.path.abspath(__file__))
+    log_file = os.path.join(file_path, proj_name + ".log")
+    # 时间格式为：2017-08-01 10:00:00 main.py[line:10] INFO Start to run the script!
+    logging.basicConfig(level=logging.DEBUG,
+                        filename=None,
+                        filemode='a',
+                        format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S'
+                        )
+    logging.info("Start to run the script!")
+    with ProcessLock(os.path.join("/tmp", proj_name + ".lock")) as lock:
+        if lock.locked:
+            main()
+        else:
+            logging.info("The script is running,exit!")
