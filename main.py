@@ -11,8 +11,6 @@ import json
 import http.client
 import atexit
 
-# Create Time: 2021-07-07 10:00:00
-# Author: me
 # Description: 通过python脚本实现pump的gc清理
 # requirements: python3.6+
 
