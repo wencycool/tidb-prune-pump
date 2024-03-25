@@ -716,7 +716,38 @@ class ProcessLock:
         self.release()
         return False
 
+
+# 查看一个文件（或目录）所在挂载点使用情况
+def get_mount_point_usage(path):
+    path = os.path.abspath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return shutil.disk_usage(path)
+
+
+# 获取当前目录所在文件系统的使用率
+def get_mount_point_used_ratio(path, pre_delete_size=0):
+    """
+    获取当前目录所在文件系统的使用率
+    :param path: 目标目录
+    :param pre_delete_size: 预先删除文件大小，在计算使用率时需要减去这个大小
+    :return: 返回使用率，如0.6表示当前挂载点使用率低于60%
+    """
+    mount_point_usage = get_mount_point_usage(path)
+    mount_point_used_ratio = round(
+        (mount_point_usage.total - mount_point_usage.free - pre_delete_size) / mount_point_usage.total, 2
+    )
+    return mount_point_used_ratio
+
+
 def main():
+    # 判断当前文件系统使用率是否超过70%，如果超过则执行清理逻辑
+    pump_mount_point = deploy_dir
+    if get_mount_point_used_ratio(pump_mount_point) < 0.7:
+        logging.info(f"{pump_mount_point} usage ratio is less than 70%,exit!")
+        return
+    else:
+        logging.warning(f"{pump_mount_point} usage ratio is more than 70%,start to do gc!")
     lock = Lock()
     try:
         if lock.acquire(timeout=300):
