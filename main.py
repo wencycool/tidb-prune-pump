@@ -39,6 +39,8 @@ import atexit
 # 3. 如果有任何pump节点在执行，则本启动对53556端口的监听，并等待3秒钟后再次判断是否有其他节点在执行（避免同时执行），如果有则等待，则只保留IP最大的节点执行
 # 4. 执行完毕后，释放监听端口
 
+# todo 在运行期间通过添加API的方式抑制altermanager对当前pump的告警，避免在运维过程中出现告警。
+
 
 deploy_dir = "/tidb-deploy/pump-8250"
 pump_config_file = pathlib.Path(deploy_dir) / "conf" / "pump.toml"
