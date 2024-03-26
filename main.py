@@ -5,8 +5,10 @@ import concurrent.futures
 import logging
 import os
 import pathlib
+import re
 import shutil
 import socket
+import subprocess
 import threading
 import time
 import urllib.request
@@ -452,17 +454,29 @@ def muti_telnet_remote_port(iports, timeout=2):
 
 
 #查询本地IP
-def get_local_ips(loopback=False):
+def get_local_ips(ignore_loopback=False):
     """
     查询本地所有IP列表
     :param loopback: 是否包含回环地址
-    :return:
+    :return: IP列表
     """
-    ips = []
-    for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-        if loopback or not ip.startswith("127"):
-            ips.append(ip)
-    return ips
+    ip_addresses = []
+    # 执行ip a命令获取网络接口信息
+    result = subprocess.run(['ip', 'a'], capture_output=True, text=True)
+    output = result.stdout
+    # 使用正则表达式匹配IP地址信息
+    ip_pattern = r'\d+\.\d+\.\d+\.\d+/\d+'
+    matches = re.findall(ip_pattern, output)
+    # 将匹配到的IP地址添加到列表中
+    ip_addresses.extend(matches)
+    result = []
+    for each_addr in ip_addresses:
+        if "/" in each_addr:
+            addr = each_addr.split("/")[0]
+            if ignore_loopback and addr.startswith("127.0.0.1"):
+                continue
+            result.append(addr)
+    return result
 
 
 class Lock:
