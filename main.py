@@ -16,8 +16,13 @@ import json
 import http.client
 import atexit
 
+
 # Description: 通过python脚本实现pump的gc清理
-# requirements: python3.6+
+# requirements: python3.6+,部署在tidb用户下,tidb用户有sudo权限，pump进程只有一个
+
+# 使用方式：
+# crontab调用脚本，每隔一段时间执行一次，这里以每30分钟执行一次为例,当磁盘使用率阈值超过70%时执行
+# */30 * * * * /usr/bin/python3 /path/to/pump_gc.py
 
 # 当pump所在的文件系统使用率超过阈值后需要对pump中的数据进行清理，清理规则为：
 # pump中的数据必须已经应用到了drainer，即pump中的数据的gcTS小于drainer的maxCommitTS
@@ -44,10 +49,13 @@ import atexit
 
 # todo 在运行期间通过添加API的方式抑制altermanager对当前pump的告警，避免在运维过程中出现告警。
 
-
-deploy_dir = "/tidb-deploy/pump-8250"
+pump_port = 8250
+deploy_user = "tidb"
+data_dir = f"/tidb-data/pump-{pump_port}"
+deploy_dir = f"/tidb-deploy/pump-{pump_port}"
 pump_config_file = pathlib.Path(deploy_dir) / "conf" / "pump.toml"
 
+SVCPORT = 53556 # 用于串行执行逻辑的端口，当前脚本运行期间会临时监听该端口，避免多个脚本同时执行
 
 def get_pump_ps_info():
     """
@@ -59,7 +67,7 @@ def get_pump_ps_info():
     base_dir = "/proc"
     for sub_dir in os.listdir(base_dir):
         base_sub_dir = os.path.join(base_dir, sub_dir)
-        if os.path.isdir(base_sub_dir) and pathlib.Path(base_sub_dir).owner() == "tidb":
+        if os.path.isdir(base_sub_dir) and pathlib.Path(base_sub_dir).owner() == deploy_user:
             cmdline_file = os.path.join(base_sub_dir, "cmdline")
             if os.path.exists(cmdline_file):
                 with open(cmdline_file, 'rb') as f:
@@ -73,12 +81,12 @@ def get_pump_ps_info():
 
 # 前置检查：
 def check_before():
-    if not os.path.exists(deploy_dir):
-        logging.error(f"{deploy_dir} is not exists")
+    if not os.path.exists(data_dir):
+        logging.error(f"{data_dir} is not exists")
         return False
     # 如果deploy_dir不是tidb用户，则返回False
-    if pathlib.Path(deploy_dir).owner() != "tidb":
-        logging.error(f"{deploy_dir} is not tidb user")
+    if pathlib.Path(data_dir).owner() != deploy_user:
+        logging.error(f"{data_dir} is not tidb user")
         return False
     # pump进程必须存在且只有一个
     pumps = get_pump_ps_info()
@@ -106,7 +114,7 @@ def get_pump_do_gc_ts():
     获取pump的do gcTS，这里的do gcTS并不是TSO，而是oracle.ExtractPhysical部分，已经做了>>18处理
     :return: 返回物理时间戳，单位为毫秒
     """
-    http_url = "http://127.0.0.1:8250/metrics"
+    http_url = f"http://127.0.0.1:{pump_port}/metrics"
     try:
         with urllib.request.urlopen(http_url) as f:
             for line in f:
@@ -124,7 +132,7 @@ def get_pump_do_gc_ts():
 # CommitTs转unix时间戳：(CommitTs >> 18) / 1000
 # http://192.168.31.100:8250/drainers 获取json数据并解析出drainer的maxCommitTS
 def get_drainer_max_commit_ts():
-    http_url = "http://127.0.0.1:8250/drainers"
+    http_url = f"http://127.0.0.1:{pump_port}/drainers"
     try:
         with urllib.request.urlopen(http_url) as f:
             data = f.read().decode('utf-8')
@@ -225,7 +233,7 @@ def check_pump_status(timeout=30):
     :param timeout: 超时时间为30s
     :return: True表示正常，False表示异常
     """
-    url = "http://127.0.0.1:8250/metrics"
+    url = f"http://127.0.0.1:{pump_port}/metrics"
 
     # 检查url是否可以访问
     def check_url(url1):
@@ -254,9 +262,9 @@ def start_pump(restart=False):
     :return:
     """
     if restart:
-        shell_cmd = "sudo systemctl restart pump-8250.service"
+        shell_cmd = f"sudo systemctl restart pump-{pump_port}.service"
     else:
-        shell_cmd = "sudo systemctl start pump-8250.service"
+        shell_cmd = f"sudo systemctl start pump-{pump_port}.service"
     logging.info(f"start or restart pump,shell command: {shell_cmd}")
     recode = os.system(shell_cmd)
     if recode != 0:
@@ -274,7 +282,7 @@ def do_pump_gc_trigger(gcTS_unix_timestamp_check: int):
     :return: True表示触发成功，False表示触发失败
     """
     host = "127.0.0.1"
-    port = 8250
+    port = pump_port
     try:
         # 做post请求
         logging.debug(f"trigger pump gc, host: {host}, port: {port}")
@@ -371,7 +379,7 @@ def get_pumps():
     获取所有pump的IP和端口
     :return: 返回所有pump的host(ip:port)列表
     """
-    http_url = "http://127.0.0.1:8250/status"
+    http_url = f"http://127.0.0.1:{pump_port}/status"
     pumps = []
     try:
         with urllib.request.urlopen(http_url) as f:
@@ -455,7 +463,7 @@ class Lock:
     """
 
     def __init__(self):
-        self.port = 53556
+        self.port = SVCPORT
         self.locked = False
         self.service = None
 
@@ -730,7 +738,7 @@ def get_mount_point_used_ratio(path, pre_delete_size=0):
 
 def check_do_gc(alarm_ratio=0.7):
     # 判断当前文件系统使用率是否超过70%，如果超过则执行清理逻辑
-    pump_mount_point = deploy_dir
+    pump_mount_point = data_dir
     used_ratio = get_mount_point_used_ratio(pump_mount_point)
     if used_ratio < alarm_ratio:
         logging.info(f"{pump_mount_point} usage ratio:{used_ratio} is less than 70%,exit!")
