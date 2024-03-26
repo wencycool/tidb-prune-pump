@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 import argparse
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
@@ -15,7 +16,6 @@ import urllib.request
 import json
 import http.client
 import atexit
-
 
 # Description: 通过python脚本实现pump的gc清理
 # requirements: python3.6+,部署在tidb用户下,tidb用户有sudo权限，pump进程只有一个
@@ -55,7 +55,8 @@ data_dir = f"/tidb-data/pump-{pump_port}"
 deploy_dir = f"/tidb-deploy/pump-{pump_port}"
 pump_config_file = pathlib.Path(deploy_dir) / "conf" / "pump.toml"
 
-SVCPORT = 53556 # 用于串行执行逻辑的端口，当前脚本运行期间会临时监听该端口，避免多个脚本同时执行
+SVCPORT = 53556  # 用于串行执行逻辑的端口，当前脚本运行期间会临时监听该端口，避免多个脚本同时执行
+
 
 def get_pump_ps_info():
     """
@@ -424,6 +425,7 @@ def muti_telnet_remote_port(iports, timeout=2):
 
     def _telnet_remote_port(host, port):
         return host, port, telnet_remote_port(host, port, timeout)
+
     with ThreadPoolExecutor(max_workers=5) as exector:
         tasks = [exector.submit(_telnet_remote_port, ip, port) for ip, port in iports]
         for task in as_completed(tasks):
@@ -440,8 +442,11 @@ def get_local_ips(ignore_loopback=False):
     """
     ip_addresses = []
     # 执行ip a命令获取网络接口信息
-    result = subprocess.run(['ip', 'a'], capture_output=True, text=True)
-    output = result.stdout
+    output, recode = command_run("/usr/sbin/ip a")
+    if recode != 0:
+        msg = f"get local ip failed: {output}"
+        logging.error(msg)
+        raise Exception(msg)
     # 使用正则表达式匹配IP地址信息
     ip_pattern = r'\d+\.\d+\.\d+\.\d+/\d+'
     matches = re.findall(ip_pattern, output)
@@ -713,6 +718,71 @@ class ProcessLock:
         return False
 
 
+def command_run(command, use_temp=False, timeout=30, stderr_to_stdout=True) -> (str, int):
+    """
+
+    :param str command: shell命令
+    :param bool use_temp: 是否使用临时文件存储结果集，对于大结果集处理有效
+    :param int timeout: 函数执行超时时间
+    :param stderr_to_stdout: 是否将错误输出合并到stdout中
+    :return: 结果集和code
+    """
+
+    def _str(input):
+        if isinstance(input, bytes):
+            return str(input, 'UTF-8')
+        return str(input)
+
+    mutable = ['', '', None]
+    # 用临时文件存放结果集效率太低，在tiup exec获取sstfile的时候因为数据量较大避免卡死建议开启，如果在获取tikv region property时候建议采用PIPE方式，效率更高
+    if use_temp:
+        out_temp = None
+        out_fileno = None
+        out_temp = tempfile.SpooledTemporaryFile(buffering=100 * 1024)
+        out_fileno = out_temp.fileno()
+
+        def target():
+            # 标准输出结果集比较大输出到文件，错误输出到PIPE
+            mutable[2] = subprocess.Popen(command, stdout=out_fileno, stderr=subprocess.PIPE, shell=True)
+            mutable[2].wait()
+
+        th = threading.Thread(target=target)
+        th.start()
+        th.join(timeout)
+        # 超时处理
+        if th.is_alive():
+            mutable[2].terminate()
+            th.join()
+            if mutable[2].returncode == 0:
+                mutable[2].returncode = 9
+            result = "Timeout Error!"
+        else:
+            out_temp.seek(0)
+            result = out_temp.read()
+        out_temp.close()
+        if stderr_to_stdout:
+            return _str(result) + _str(mutable[2].stderr.read()), mutable[2].returncode
+        else:
+            return _str(result), mutable[2].returncode
+    else:
+        def target():
+            mutable[2] = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            mutable[0], mutable[1] = mutable[2].communicate()
+
+        th = threading.Thread(target=target)
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            mutable[2].terminate()
+            th.join()
+            if mutable[2].returncode == 0:
+                mutable[2].returncode = 1
+        if stderr_to_stdout:
+            return _str(mutable[0]) + _str(mutable[1]), mutable[2].returncode
+        else:
+            return _str(mutable[0]), mutable[2].returncode
+
+
 # 查看一个文件（或目录）所在挂载点使用情况
 def get_mount_point_usage(path):
     path = os.path.abspath(path)
@@ -763,8 +833,8 @@ def check_do_gc(alarm_ratio=0.7):
 
 def main():
     parser = argparse.ArgumentParser(description="tidb-pump清理工具")
-    parser.add_argument('a', '--alarm', type=float, default=0.7, help="文件系统使用率告警阈值,超过该阈值则执行gc动作",
-                        required=True)
+    parser.add_argument('-a', '--alarm', type=float, default=0.7, help="文件系统使用率告警阈值,超过该阈值则执行gc动作",
+                        required=False)
     args = parser.parse_args()
     alarm = args.alarm
     if args.alarm < 0 or args.alarm > 1 or not args.alarm:
