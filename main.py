@@ -774,7 +774,7 @@ if __name__ == "__main__":
     log_file = os.path.join(file_path, proj_name + ".log")
     # 时间格式为：2017-08-01 10:00:00 main.py[line:10] INFO Start to run the script!
     logging.basicConfig(level=logging.DEBUG,
-                        filename=None,
+                        filename=log_file,
                         filemode='a',
                         format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S'
