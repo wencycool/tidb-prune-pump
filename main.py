@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 import argparse
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import pathlib
@@ -49,18 +49,6 @@ deploy_dir = "/tidb-deploy/pump-8250"
 pump_config_file = pathlib.Path(deploy_dir) / "conf" / "pump.toml"
 
 
-# 将科学计数法的字符串转换为整数
-def scientific_to_int(scientific_str):
-    """
-    将科学计数法的字符串转换为整数
-    :param scientific_str:科学计数法的字符串
-    :return:整数
-    """
-    from decimal import Decimal, ROUND_DOWN
-    num = Decimal(scientific_str)
-    return int(num.to_integral_value(rounding=ROUND_DOWN))
-
-
 def get_pump_ps_info():
     """
     找到pump进程的pid、当前工作目录和cmdline列表
@@ -81,22 +69,6 @@ def get_pump_ps_info():
                         logging.debug(f"find pump process: {sub_dir}, cmdline: {cmdline_str}")
                         pumps.append([sub_dir, os.path.realpath(os.path.join(base_sub_dir, "cwd")), cmdline_list])
     return pumps
-
-
-def check_port_inuse(port):
-    """
-    查看端口是否被占用
-    不能通过该方式判断，因为在执行过程中可能占用了端口导致pump无法启动
-    :param port:
-    :return:
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("0.0.0.0", port))
-        s.close()
-        return False
-    except Exception as e:
-        return True  # 端口被占用
 
 
 # 前置检查：
@@ -129,7 +101,7 @@ def ts_to_time(ts):
 
 # 获取pump的do gcTC
 # 从http://192.168.31.100:8250/metrics获取pump的metrics信息，并解析出binlog_pump_storage_done_gc_ts 的值
-def get_pump_do_gcTS():
+def get_pump_do_gc_ts():
     """
     获取pump的do gcTS，这里的do gcTS并不是TSO，而是oracle.ExtractPhysical部分，已经做了>>18处理
     :return: 返回物理时间戳，单位为毫秒
@@ -151,7 +123,7 @@ def get_pump_do_gcTS():
 # 查看drainer的maxCommitTS
 # CommitTs转unix时间戳：(CommitTs >> 18) / 1000
 # http://192.168.31.100:8250/drainers 获取json数据并解析出drainer的maxCommitTS
-def get_drainer_maxCommitTS():
+def get_drainer_max_commit_ts():
     http_url = "http://127.0.0.1:8250/drainers"
     try:
         with urllib.request.urlopen(http_url) as f:
@@ -188,7 +160,7 @@ def generate_golang_duration(duration):
 
 
 # 生成pump的gcTS
-def generate_pump_safe_gcTS(drainer_maxCommitTS, offset=10 * 60):
+def generate_pump_safe_gc_ts(drainer_maxCommitTS, offset=10 * 60):
     """
     生成pump的gcTS，默认为drainer的maxCommitTS - 10分钟，格式为golagn的时间字符串表达式，如：1h,10m,1h30m5s等，如果不带任何单位则为天，比如：1 代表1天
     :param drainer_maxCommitTS: drainer的maxCommitTS，小于该值的数据可以被清理
@@ -321,7 +293,7 @@ def do_pump_gc_trigger(gcTS_unix_timestamp_check: int):
         return False
     # 该接口是异步的，需要循环检测gc是否完成
     logging.debug(f"trigger pump gc success, wait for gc done")
-    do_gcTS = get_pump_do_gcTS()
+    do_gcTS = get_pump_do_gc_ts()
     if do_gcTS is None:
         return False
     logging.debug(f"do pump gcTS: {do_gcTS}")
@@ -340,7 +312,7 @@ def do_pump_gc_trigger(gcTS_unix_timestamp_check: int):
             logging.debug(
                 f"do pump gcTS: {do_gcTS_unix_timestamp_format} less than gcTS_unix_timestamp_check: {gcTS_unix_timestamp_check_format}, repeat check...")
         time.sleep(1)
-        do_gcTS = get_pump_do_gcTS()
+        do_gcTS = get_pump_do_gc_ts()
         if do_gcTS is None:
             return False
     else:
@@ -444,8 +416,6 @@ def muti_telnet_remote_port(iports, timeout=2):
 
     def _telnet_remote_port(host, port):
         return host, port, telnet_remote_port(host, port, timeout)
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=5) as exector:
         tasks = [exector.submit(_telnet_remote_port, ip, port) for ip, port in iports]
         for task in as_completed(tasks):
@@ -453,7 +423,7 @@ def muti_telnet_remote_port(iports, timeout=2):
     return results
 
 
-#查询本地IP
+# 查询本地IP
 def get_local_ips(ignore_loopback=False):
     """
     查询本地所有IP列表
@@ -546,6 +516,7 @@ class Lock:
             except Exception as e:
                 pass
 
+
 # todo 添加文件系统使用率判断规则
 
 
@@ -560,12 +531,12 @@ def do_pump_gc():
         return False
     # 获取drainer的maxCommitTS
     logging.info("start to get drainer maxCommitTS")
-    drainer_maxCommitTS = get_drainer_maxCommitTS()
+    drainer_maxCommitTS = get_drainer_max_commit_ts()
     if drainer_maxCommitTS is None:
         return False
     # 生成pump的gcTS
     logging.info("start to generate pump gcTS")
-    gcTS, gcTS_unix_timestamp_check = generate_pump_safe_gcTS(drainer_maxCommitTS)
+    gcTS, gcTS_unix_timestamp_check = generate_pump_safe_gc_ts(drainer_maxCommitTS)
     if gcTS is None:
         return False
     # 修改pump.toml文件
@@ -781,9 +752,11 @@ def check_do_gc(alarm_ratio=0.7):
         logging.error(f"main error: {e}")
         lock.release()
 
+
 def main():
     parser = argparse.ArgumentParser(description="tidb-pump清理工具")
-    parser.add_argument('a','--alarm',type=float,default=0.7,help="文件系统使用率告警阈值,超过该阈值则执行gc动作",required=True)
+    parser.add_argument('a', '--alarm', type=float, default=0.7, help="文件系统使用率告警阈值,超过该阈值则执行gc动作",
+                        required=True)
     args = parser.parse_args()
     alarm = args.alarm
     if args.alarm < 0 or args.alarm > 1 or not args.alarm:
@@ -806,5 +779,7 @@ def main():
             check_do_gc(alarm)
         else:
             logging.info("The script is running,exit!")
+
+
 if __name__ == "__main__":
     main()
