@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # coding=utf-8
+import argparse
 import concurrent.futures
 import logging
 import os
@@ -742,14 +743,15 @@ def get_mount_point_used_ratio(path, pre_delete_size=0):
     return mount_point_used_ratio
 
 
-def main():
+def check_do_gc(alarm_ratio=0.7):
     # 判断当前文件系统使用率是否超过70%，如果超过则执行清理逻辑
     pump_mount_point = deploy_dir
-    if get_mount_point_used_ratio(pump_mount_point) < 0.7:
-        logging.info(f"{pump_mount_point} usage ratio is less than 70%,exit!")
+    used_ratio = get_mount_point_used_ratio(pump_mount_point)
+    if used_ratio < alarm_ratio:
+        logging.info(f"{pump_mount_point} usage ratio:{used_ratio} is less than 70%,exit!")
         return
     else:
-        logging.warning(f"{pump_mount_point} usage ratio is more than 70%,start to do gc!")
+        logging.warning(f"{pump_mount_point} usage ratio:{used_ratio} is more than 70%,start to do gc!")
     lock = Lock()
     try:
         if lock.acquire(timeout=300):
@@ -765,8 +767,13 @@ def main():
         logging.error(f"main error: {e}")
         lock.release()
 
-
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="tidb-pump清理工具")
+    parser.add_argument('a','--alarm',type=float,default=0.7,help="文件系统使用率告警阈值,超过该阈值则执行gc动作",required=True)
+    args = parser.parse_args()
+    alarm = args.alarm
+    if args.alarm < 0 or args.alarm > 1 or not args.alarm:
+        alarm = 0.7
     # 输出到日志文件中，日志文件名为当前脚本的名字加.log后缀
     proj_name = os.path.basename(__file__).split(".")[0]
     # 绝对路径
@@ -782,6 +789,8 @@ if __name__ == "__main__":
     logging.info("Start to run the script!")
     with ProcessLock(os.path.join("/tmp", proj_name + ".lock")) as lock:
         if lock.locked:
-            main()
+            check_do_gc(alarm)
         else:
             logging.info("The script is running,exit!")
+if __name__ == "__main__":
+    main()
