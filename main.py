@@ -132,20 +132,32 @@ def get_pump_do_gc_ts():
 # 查看drainer的maxCommitTS
 # CommitTs转unix时间戳：(CommitTs >> 18) / 1000
 # http://192.168.31.100:8250/drainers 获取json数据并解析出drainer的maxCommitTS
-def get_drainer_max_commit_ts():
+def get_drainer_max_commit_ts(state_online=True):
+    """
+    :param state_online: True表示值查找存活的drainer节点，False需要查找所有drainer（可能会遍历残留在etcd中的已下线的drainer的maxcommitts)
+    :return:
+    """
     http_url = f"http://127.0.0.1:{pump_port}/drainers"
+    # 可能包含多个drainer，需要判断的drainer的maxCommitTS，找出最小值作为commitTS
+    min_max_commit_ts = 0 # 查找所有drainer的max_commit_ts最小的值
     try:
         with urllib.request.urlopen(http_url) as f:
             data = f.read().decode('utf-8')
             data = json.loads(data)
-            max_commit_ts = int(data[0]["maxCommitTS"])
-            max_commit_ts_format = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_to_time(max_commit_ts)))
-            logging.debug(f"get drainer maxCommitTS: {max_commit_ts},format: {max_commit_ts_format}")
-            return max_commit_ts
+            for each_drainer in data:
+                state = each_drainer["state"]
+                if state_online and state != "online":
+                    continue
+                host = each_drainer["host"]
+                max_commit_ts = int(each_drainer["maxCommitTS"])
+                max_commit_ts_format = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_to_time(max_commit_ts)))
+                logging.debug(f"host:{host} get drainer maxCommitTS: {max_commit_ts},format: {max_commit_ts_format}")
+                if min_max_commit_ts == 0 or min_max_commit_ts > max_commit_ts:
+                    min_max_commit_ts = max_commit_ts
     except Exception as e:
         logging.error(f"get drainer maxCommitTS failed: {e}")
         return None
-
+    return min_max_commit_ts
 
 # 给定一个秒的duration，生成golang的时间字符串表达式，如：1h,10m,1h30m5s等，如果不带任何单位则为天，比如：1 代表1天
 def generate_golang_duration(duration):
